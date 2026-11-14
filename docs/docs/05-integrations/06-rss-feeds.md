@@ -39,7 +39,7 @@ Karakeep can automatically monitor RSS feeds and create bookmarks from new entri
 2. Click **Add Feed**
 3. Enter the feed details:
    - **Name**: A friendly name for the feed
-   - **URL**: The RSS/Atom feed URL
+   - **URL**: The RSS/Atom feed URL, or the URL of a website that advertises its feed (Karakeep finds the feed and replaces the URL with it on the first successful fetch)
    - **Enabled**: Toggle to enable/disable the feed
    - **Import Tags**: Enable to import RSS categories as bookmark tags
 
