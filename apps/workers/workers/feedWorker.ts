@@ -15,6 +15,7 @@ import { workerStatsCounter } from "../metrics";
 import { fetchWithProxy } from "../network";
 import { buildImpersonatingTRPCClient } from "../trpc";
 import { withWorkerEventLog, withWorkerTracing } from "../workerTracing";
+import { discoverFeedUrls } from "./utils/feedDiscovery";
 import { parseFeedItems } from "./utils/feedParser";
 
 type FeedRunResult = "success" | "failure";
@@ -164,6 +165,62 @@ export class FeedWorker {
   }
 }
 
+type FeedDocument =
+  | {
+      ok: true;
+      kind: "xml" | "html" | "other";
+      /** Final URL after redirects, used to resolve relative feed links. */
+      url: string;
+      statusCode: number;
+      body: string;
+    }
+  | { ok: false; reason: string; statusCode?: number };
+
+async function fetchFeedDocument(url: string): Promise<FeedDocument> {
+  let response;
+  try {
+    response = await fetchWithProxy(url, {
+      signal: AbortSignal.timeout(5000),
+      headers: {
+        "User-Agent": "Karakeep-RSS/1.0 (+https://karakeep.com)",
+        Accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
+      },
+    });
+  } catch (error) {
+    return { ok: false, reason: `failed to fetch: ${getErrorMessage(error)}` };
+  }
+
+  const statusCode = response.status;
+  if (statusCode !== 200) {
+    return {
+      ok: false,
+      statusCode,
+      reason: `returned a non-success status: ${statusCode}`,
+    };
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  const kind = contentType.includes("xml")
+    ? "xml"
+    : contentType.includes("text/html")
+      ? "html"
+      : "other";
+  if (kind === "other") {
+    return { ok: true, kind, url, statusCode, body: "" };
+  }
+
+  try {
+    const body = await response.text();
+    return { ok: true, kind, url: response.url || url, statusCode, body };
+  } catch (error) {
+    return {
+      ok: false,
+      statusCode,
+      reason: `failed to read: ${getErrorMessage(error)}`,
+    };
+  }
+}
+
 async function run(
   req: DequeuedJob<ZFeedRequestSchema>,
 ): Promise<FeedRunResult> {
@@ -198,57 +255,53 @@ async function run(
     `[feed][${jobId}] Starting fetching feed "${feed.name}" (${feed.id}) ...`,
   );
 
-  let response;
-  try {
-    response = await fetchWithProxy(feed.url, {
-      signal: AbortSignal.timeout(5000),
-      headers: {
-        "User-Agent": "Karakeep-RSS/1.0 (+https://karakeep.com)",
-        Accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
-      },
-    });
-  } catch (error) {
+  const feedLabel = `Feed "${feed.name}" (${feed.id})`;
+  const skipping = "Skipping until the next scheduled fetch.";
+
+  let document = await fetchFeedDocument(feed.url);
+
+  // The URL may be a website rather than a feed: look for the feed the page
+  // advertises and, once it parses, store it as the feed's URL.
+  let discoveredUrl: string | undefined;
+  if (document.ok && document.kind === "html") {
+    discoveredUrl = discoverFeedUrls(document.body, document.url)[0];
+    if (!discoveredUrl) {
+      logger.warn(
+        `[feed][${jobId}] ${feedLabel} is a web page that doesn't advertise an RSS/Atom feed. ${skipping}`,
+      );
+      return "failure";
+    }
+    logger.info(
+      `[feed][${jobId}] ${feedLabel} is a web page; using the feed it advertises: ${discoveredUrl}`,
+    );
+    addLogFields<"feedWorker.run">({ "feed.discovered_url": discoveredUrl });
+    document = await fetchFeedDocument(discoveredUrl);
+  }
+
+  if (document.statusCode !== undefined) {
+    addLogFields<"feedWorker.run">({ "feed.status_code": document.statusCode });
+  }
+  if (!document.ok) {
     logger.warn(
-      `[feed][${jobId}] Failed to fetch feed "${feed.name}" (${feed.id}): ${getErrorMessage(error)}. Skipping until the next scheduled fetch.`,
+      `[feed][${jobId}] ${feedLabel} ${document.reason}. ${skipping}`,
+    );
+    return "failure";
+  }
+  if (document.kind !== "xml") {
+    logger.warn(
+      `[feed][${jobId}] ${feedLabel} is not a valid RSS feed. ${skipping}`,
     );
     return "failure";
   }
 
-  addLogFields<"feedWorker.run">({ "feed.status_code": response.status });
-  if (response.status !== 200) {
-    logger.warn(
-      `[feed][${jobId}] Feed "${feed.name}" (${feed.id}) returned a non-success status: ${response.status}. Skipping until the next scheduled fetch.`,
-    );
-    return "failure";
-  }
-  const contentType = response.headers.get("content-type");
-  if (!contentType || !contentType.includes("xml")) {
-    logger.warn(
-      `[feed][${jobId}] Feed "${feed.name}" (${feed.id}) is not a valid RSS feed. Skipping until the next scheduled fetch.`,
-    );
-    return "failure";
-  }
-
-  let xmlData;
-  try {
-    xmlData = await response.text();
-  } catch (error) {
-    logger.warn(
-      `[feed][${jobId}] Failed to read feed "${feed.name}" (${feed.id}): ${getErrorMessage(error)}. Skipping until the next scheduled fetch.`,
-    );
-    return "failure";
-  }
-
-  logger.info(
-    `[feed][${jobId}] Successfully fetched feed "${feed.name}" (${feed.id}) ...`,
-  );
+  logger.info(`[feed][${jobId}] Successfully fetched ${feedLabel} ...`);
 
   let feedItems;
   try {
-    feedItems = await parseFeedItems(xmlData);
+    feedItems = await parseFeedItems(document.body);
   } catch (error) {
     logger.warn(
-      `[feed][${jobId}] Failed to parse feed "${feed.name}" (${feed.id}): ${getErrorMessage(error)}. Skipping until the next scheduled fetch.`,
+      `[feed][${jobId}] Failed to parse ${feedLabel}: ${getErrorMessage(error)}. ${skipping}`,
     );
     return "failure";
   }
@@ -256,7 +309,10 @@ async function run(
   addLogFields<"feedWorker.run">({ "feed.items_found": feedItems.length });
   await db
     .update(rssFeedsTable)
-    .set({ lastSuccessfulFetchAt: new Date() })
+    .set({
+      lastSuccessfulFetchAt: new Date(),
+      ...(discoveredUrl ? { url: discoveredUrl } : {}),
+    })
     .where(eq(rssFeedsTable.id, feed.id));
 
   logger.info(

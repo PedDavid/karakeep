@@ -65,6 +65,33 @@ describe("Feed Worker Tests", () => {
     expect(urls).toContain("http://nginx:80/hello.html?article=2");
   });
 
+  it("should discover the feed advertised by a web page and store its URL", async () => {
+    const trpcClient = getTrpcClient(apiKey);
+
+    const feed = await trpcClient.feeds.create.mutate({
+      name: "Test Blog",
+      url: "http://nginx:80/blog.html",
+      enabled: true,
+    });
+
+    await trpcClient.feeds.fetchNow.mutate({ feedId: feed.id });
+    await waitUntil(async () => {
+      const updated = await trpcClient.feeds.get.query({ feedId: feed.id });
+      return updated.lastFetchedStatus === "success";
+    }, "Feed discovered from web page is fetched successfully");
+
+    const fetchedFeed = await trpcClient.feeds.get.query({ feedId: feed.id });
+    expect(fetchedFeed.url).toBe("http://nginx:80/feed.xml");
+
+    const bookmarks = await trpcClient.bookmarks.getBookmarks.query({
+      archived: false,
+    });
+    expect(bookmarks.bookmarks.map((b) => b.title).sort()).toEqual([
+      "First Test Article",
+      "Second Test Article",
+    ]);
+  });
+
   it("should import tags from RSS categories when importTags is enabled", async () => {
     const trpcClient = getTrpcClient(apiKey);
 

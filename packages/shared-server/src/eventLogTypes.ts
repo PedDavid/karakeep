@@ -49,6 +49,7 @@ type EventLogInternal =
       ["event.name"]: "feedWorker.run";
       "feed.id"?: string;
       "feed.url"?: string;
+      "feed.discovered_url"?: string;
       "feed.status_code"?: number;
       "feed.items_found"?: number;
       "feed.items_new"?: number;
